@@ -18,6 +18,16 @@ import { join } from "node:path"
 //
 // The credential is re-read on every refresh so OAuth token rotation is
 // handled automatically.
+//
+// Local visual rework (based on upstream v0.1.1, commit fab6083):
+//   - status dot in the header shows the tightest window at a glance
+//   - per-row color escalates green -> yellow -> red as the window fills
+//   - right-aligned percent, smoother 12-char bars, compact countdowns
+//   - a window at its limit shows MAX in the error color
+//
+// IMPORTANT (Solid): every value derived from reactive state is computed
+// INSIDE the JSX expressions. Component bodies run only once, so hoisting
+// these into locals freezes them at the pre-data render.
 
 const USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 
@@ -100,18 +110,11 @@ async function fetchUsage(key: string): Promise<Usage> {
   return body.usage ?? {}
 }
 
-function countdown(iso?: string): string {
-  if (!iso) return ""
-  const diff = new Date(iso).getTime() - Date.now()
-  if (!Number.isFinite(diff)) return ""
-  if (diff <= 0) return "resetting"
-  const mins = Math.floor(diff / 60000)
-  const days = Math.floor(mins / 1440)
-  const hours = Math.floor((mins % 1440) / 60)
-  if (days > 0) return `in ${days}d ${hours}h`
-  if (hours > 0) return `in ${hours}h ${mins % 60}m`
-  return `in ${mins}m`
-}
+// ---- formatting helpers (pure functions of their arguments) --------------
+
+const BAR_WIDTH = 12
+const LABEL_WIDTH = 3
+const PCT_WIDTH = 4
 
 type Theme = {
   text?: {
@@ -125,39 +128,41 @@ type Theme = {
   }
 }
 
-function headStr(win: UsageWindow | undefined, label: string): string {
-  if (!win || typeof win.percent !== "number") return `${label} …`
-  return `${label} ${String(Math.round(win.percent)).padStart(3)}% `
+function levelFor(win: UsageWindow | undefined): 0 | 1 | 2 | 3 {
+  if (!win || typeof win.percent !== "number") return 0
+  if (win.status === "limited" || win.percent >= 80) return 3
+  if (win.percent >= 50) return 2
+  return 1
 }
 
-function barCounts(win: UsageWindow | undefined): { filled: number; total: number } {
-  const total = 10
-  if (!win || typeof win.percent !== "number") return { filled: 0, total }
-  const p = Math.max(0, Math.min(100, win.percent))
-  return { filled: Math.round((p / 100) * total), total }
+function countdown(iso?: string): string {
+  if (!iso) return ""
+  const diff = new Date(iso).getTime() - Date.now()
+  if (!Number.isFinite(diff)) return ""
+  if (diff <= 0) return "now"
+  const mins = Math.floor(diff / 60000)
+  const days = Math.floor(mins / 1440)
+  const hours = Math.floor((mins % 1440) / 60)
+  if (days >= 10) return `${days}d`
+  if (days > 0) return `${days}d ${hours}h`
+  if (hours > 0) return `${hours}h ${mins % 60}m`
+  return `${mins}m`
 }
 
-function fillStr(win: UsageWindow | undefined): string {
-  return "█".repeat(barCounts(win).filled)
-}
-
-function trackStr(win: UsageWindow | undefined): string {
-  const b = barCounts(win)
-  return "░".repeat(b.total - b.filled)
-}
-
-function cdStr(win: UsageWindow | undefined): string {
-  if (!win || typeof win.percent !== "number") return ""
-  const c = countdown(win.resetsAt)
-  return c ? ` ${c}` : ""
-}
+// ---- component ----------------------------------------------------------
 
 function GoUsage(props: { intervalSeconds: number; theme?: Theme }) {
   const [usage, setUsage] = createSignal<Usage | undefined>()
   const [error, setError] = createSignal<string | undefined>()
 
   const refresh = async () => {
-    const key = readKey()
+    let key: string | undefined
+    try {
+      key = readKey()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return
+    }
     if (!key) {
       setError("no credential")
       return
@@ -179,40 +184,81 @@ function GoUsage(props: { intervalSeconds: number; theme?: Theme }) {
     if (refreshFn === refresh) refreshFn = undefined
   })
 
-  const title = () => (error() ? `Go Usage · ${error()}` : "Go Usage")
-  const base = () => props.theme?.text?.base
-  const muted = () => props.theme?.text?.muted
-  const fill = () => props.theme?.text?.feedback?.success?.base ?? props.theme?.text?.base
+  const t = props.theme?.text
+
+  // every helper is invoked inside JSX braces so it re-runs when `usage`
+  // or `error` change (Solid: bodies run once, JSX expressions are reactive)
+  const c = () => ({
+    base: t?.base,
+    muted: t?.muted,
+    success: t?.feedback?.success?.base ?? t?.base,
+    warning: t?.feedback?.warning?.base ?? t?.muted,
+    error: t?.feedback?.error?.base ?? t?.muted,
+  })
+
+  const color = (win: UsageWindow | undefined) => {
+    const cc = c()
+    const level = levelFor(win)
+    if (level === 3) return cc.error
+    if (level === 2) return cc.warning
+    if (level === 1) return cc.success
+    return cc.muted
+  }
+
+  const dotColor = () => {
+    const cc = c()
+    if (error()) return cc.warning
+    const worst = Math.max(levelFor(usage()?.rolling), levelFor(usage()?.weekly), levelFor(usage()?.monthly))
+    if (worst === 3) return cc.error
+    if (worst === 2) return cc.warning
+    if (worst === 1) return cc.success
+    return cc.muted
+  }
+
+  const pct = (win: UsageWindow | undefined) => {
+    if (!win || typeof win.percent !== "number") return "…"
+    if (win.status === "limited") return "MAX"
+    return `${Math.round(win.percent)}%`
+  }
+
+  const fill = (win: UsageWindow | undefined) => {
+    const p = win && typeof win.percent === "number" ? Math.max(0, Math.min(100, win.percent)) : 0
+    // any nonzero percent always shows at least one filled block, so the
+    // fill never silently disappears on a short bar
+    const filled = p > 0 ? Math.max(1, Math.round((p / 100) * BAR_WIDTH)) : 0
+    return "█".repeat(filled)
+  }
+
+  const track = (win: UsageWindow | undefined) => {
+    const p = win && typeof win.percent === "number" ? Math.max(0, Math.min(100, win.percent)) : 0
+    const filled = p > 0 ? Math.max(1, Math.round((p / 100) * BAR_WIDTH)) : 0
+    return "░".repeat(BAR_WIDTH - filled)
+  }
+
+  const cd = (win: UsageWindow | undefined) => {
+    const text = countdown(win?.resetsAt)
+    return text ? ` ${text}` : ""
+  }
+
+  const Row = (p: { label: string; win: UsageWindow | undefined }) => (
+    <box flexDirection="row">
+      <text flexShrink={0} fg={c().muted}>{p.label.padEnd(LABEL_WIDTH)} </text>
+      <text flexShrink={0} fg={color(p.win)}>{pct(p.win).padStart(PCT_WIDTH)} </text>
+      <text flexShrink={0} fg={color(p.win)}>{fill(p.win)}</text>
+      <text flexShrink={0} fg={c().muted}>{track(p.win)}</text>
+      <text flexShrink={0} fg={c().muted}>{cd(p.win)}</text>
+    </box>
+  )
 
   return (
     <box flexDirection="column">
-      <text
-        fg={
-          error()
-            ? props.theme?.text?.feedback?.warning?.base ?? props.theme?.text?.muted
-            : props.theme?.text?.base
-        }
-      >
-        {title()}
-      </text>
       <box flexDirection="row">
-        <text fg={base()}>{headStr(usage()?.rolling, "5h ")}</text>
-        <text fg={fill()}>{fillStr(usage()?.rolling)}</text>
-        <text fg={muted()}>{trackStr(usage()?.rolling)}</text>
-        <text fg={muted()}>{cdStr(usage()?.rolling)}</text>
+        <text flexShrink={0} fg={dotColor()}>● </text>
+        <text flexShrink={0} fg={c().base}>{error() ? `Go Usage · ${error()}` : "Go Usage"}</text>
       </box>
-      <box flexDirection="row">
-        <text fg={base()}>{headStr(usage()?.weekly, "1w ")}</text>
-        <text fg={fill()}>{fillStr(usage()?.weekly)}</text>
-        <text fg={muted()}>{trackStr(usage()?.weekly)}</text>
-        <text fg={muted()}>{cdStr(usage()?.weekly)}</text>
-      </box>
-      <box flexDirection="row">
-        <text fg={base()}>{headStr(usage()?.monthly, "1mo")}</text>
-        <text fg={fill()}>{fillStr(usage()?.monthly)}</text>
-        <text fg={muted()}>{trackStr(usage()?.monthly)}</text>
-        <text fg={muted()}>{cdStr(usage()?.monthly)}</text>
-      </box>
+      <Row label="5h" win={usage()?.rolling} />
+      <Row label="1w" win={usage()?.weekly} />
+      <Row label="1mo" win={usage()?.monthly} />
     </box>
   )
 }
